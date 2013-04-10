@@ -62,6 +62,29 @@ class CompletableBehavior extends ModelBehavior {
         return true;
     }
 
+
+    public function prepareData(Model $model) {
+        $separator = $this->settings[$model->alias]['separator'];
+
+        foreach ($this->settings[$model->alias]['relations'] as $relation => $value) {
+            if (!isset($model->data[$model->alias][$relation])) {
+                continue;
+            }
+
+            $model->set(
+                $this->insertDataInModel(
+                    $model,
+                    $relation,
+                    $this->processKeywords($model, $relation, $value)
+                )
+            );
+
+        }
+
+        return true;
+    }
+
+
     /**
      * Insert the data inside the model
      * 
@@ -74,20 +97,43 @@ class CompletableBehavior extends ModelBehavior {
      */
     protected function insertDataInModel(Model $model, $relation, $processed)
     {
+
         unset($model->data[$model->alias][$relation]);
+
         if (is_string($processed)) {
             $assocs = $model->getAssociated();
+
             $foreignKey = ($model->{$assocs[$relation]}[$relation]['foreignKey']);
             $model->data[$model->alias][$foreignKey] = $processed;
+
 
             return $model->data;
         }
 
-        $model->data[$relation] = array(
-            $relation => $processed
-        );
+        /* Regular usage for other relations */
 
-        return $model->data;
+        if(empty($this->settings[$model->alias]['relations'][$relation]['hasManyThrough'])){
+            
+            $model->data[$relation] = array(
+                $relation => $processed
+            );
+            return $model->data;
+        }
+
+        /* In order to correctly use a HasManyThrough it must be declared in the actsAs config*/ 
+        /* It has to be added as hasManyThrough in the same way the field and multiple fields*/
+
+
+        if(!empty($this->settings[$model->alias]['relations'][$relation]['hasManyThrough'])){
+
+            foreach ($processed as $process){
+                $model->data[$relation][] = $process;    
+            }
+            return $model->data;
+            
+        }
+
+        
     }
 
     /**
@@ -101,13 +147,149 @@ class CompletableBehavior extends ModelBehavior {
      * @access  protected
      */
     protected function processKeywords(Model $model, $relation, $value) {
+
         $keyword = $model->data[$model->alias][$relation];
+            
+        if ($value['multiple'] == false && is_array($keyword)){
+
+            return $this->processMultipleFieldsRelation($model, $relation, $keyword);
+        }
+
+        if ($value['multiple'] == true && is_array($keyword)){
+
+            if (isset($value['hasManyThrough'])){
+                return $this->processMultipleEntriesHMTRelation($model, $relation, $keyword, $value);
+            }
+
+            if (!isset($value['hasManyThrough'])){
+                return $this->processMultipleEntriesRelation($model, $relation, $keyword, $value);   
+            }
+            
+            
+        }
+
         if (!isset($value['multiple']) || $value['multiple'] == false) {
-            return $this->processSingleKeywordRelation($model, $relation, $keyword);
+
+            return $this->processSingleKeywordRelation($model, $relation, $keyword); 
         }
 
         return $this->processMultipleKeywordRelation($model, $relation, $keyword);
     }
+
+
+    /**
+    *   Has Many Through to save data in the linking table
+    *   
+    */
+    protected function processMultipleEntriesRelation(Model $model, $relation, $keywords)
+    {
+
+        foreach ($keywords as $keyword){
+            $keyword = $this->getKeyword($model, $relation, $keyword);
+
+            if (!$keyword) {
+                $keyword = $this->addMultipleFieldsKeyword($model, $relation, $value);
+            }
+            
+            $keyword[$relation][$model->{$relation}->primaryKey] = $model->{$relation}->getLastInsertId();
+            $savedData[] = $keyword[$relation][$model->{$relation}->primaryKey];
+
+        }
+
+        return $savedData;
+    }
+
+
+    /**
+    *   Has Many Through to save data in the linking table
+    *   
+    */
+    protected function processMultipleEntriesHMTRelation(Model $model, $relation, $keywords, $value)
+    {
+
+        foreach ($keywords as &$keyword){
+
+            foreach ($keyword as $key => $word ){
+
+                if ($key == $value['hasManyThrough']){
+
+                    $backup = $word;
+                    $word = $model->NetworksActivity->Activity->find(
+                        'first',
+                        array(
+                            'conditions' => array(
+                                $this->getSearchFieldOfRelation($model, $relation) => $word
+                            )
+                        )
+                    );
+
+                    if ($word){
+                        $keyword['activity_id'] = (int) $word['Activity']['id'];
+                    }
+
+                    if (!$word) {
+
+                        $toSave = array(
+                            'Activity' => array(
+                                $this->getSearchFieldOfRelation($model, $relation) => $backup
+                            )
+                        );
+
+                        $model->NetworksActivity->Activity->create();
+                        $word = $model->NetworksActivity->Activity->save($toSave);
+                        $keyword['activity_id'] = (int) $model->NetworksActivity->Activity->getLastInsertId();
+
+                    }
+                    
+                    unset($keyword['Activity']);
+
+                }
+            }
+
+        }
+
+        return $keywords;
+    }
+
+    /**
+    *
+    *
+    */
+    protected function processMultipleFieldsRelation(Model $model, $relation, $keyword) {
+
+        $search = $this->getSearchField($model, $relation, $keyword);
+        $value = $keyword;
+        $keyword = $this->getKeyword($model, $relation, $search);
+
+        if (!$keyword) {
+            $keyword = $this->addMultipleFieldsKeyword($model, $relation, $value);
+        }
+
+        $keyword[$relation][$model->{$relation}->primaryKey] = $model->{$relation}->getLastInsertId();
+        $savedData[] = $keyword[$relation][$model->{$relation}->primaryKey];
+
+        return $savedData;
+    }
+
+    protected function getSearchField($model, $relation, $keyword) 
+    {
+
+        $data = $this->settings[$model->alias]['relations'][$relation];
+
+        if (!empty($data['virtual'])) {
+
+            foreach ($data['virtual'] as $field) {
+                $searchField[$field] = $keyword[$field];
+            }
+            
+            $field = implode(' ', $searchField);
+
+            return $field;    
+        }
+
+        return false;
+    }
+
 
     /**
      * Normalize when it is a single keyword
@@ -164,6 +346,7 @@ class CompletableBehavior extends ModelBehavior {
      */  
     protected function getKeyword(Model $model, $relation, $keyword)
     {
+
         return $model->{$relation}->find(
             'first',
             array(
@@ -197,6 +380,32 @@ class CompletableBehavior extends ModelBehavior {
         $data[$relation][$model->{$relation}->primaryKey] = $model->{$relation}->getLastInsertId();
         
         return $data;
+    }
+
+     /**
+     * Insert the given fields in database
+     * 
+     * @param Model  $model  Model using this behavior
+     * @param string $relation  The relation to insert data
+     * @param string $keyword  The given config of the relation
+     * 
+     * @return  midex
+     * @access  protected
+     */
+    protected function addMultipleFieldsKeyword($model, $relation, $keyword)
+    {
+        $toSave = array(
+            $relation => $keyword
+        );
+
+        $model->{$relation}->create();
+
+        $data = $model->{$relation}->save($toSave);
+
+        $data[$relation][$model->{$relation}->primaryKey] = $model->{$relation}->getLastInsertId();
+
+        return $data;
+
     }
 
     /**
